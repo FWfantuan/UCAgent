@@ -658,16 +658,16 @@ async function loadTasks() {
   const q = document.getElementById('filter-q').value.trim();
   const url = `/api/tasks?status=${encodeURIComponent(status)}&dut=${encodeURIComponent(dut)}&q=${encodeURIComponent(q)}`;
   try {
-    const [data, totalData, waitingData] = await Promise.all([
-      api(url),
-      api('/api/tasks'),
-      api('/api/tasks?status=waiting'),
+    const totalRequest = api('/api/tasks');
+    const [data, totalData] = await Promise.all([
+      status || dut || q ? api(url) : totalRequest,
+      totalRequest,
     ]);
     allTasks = data.tasks || [];
     totalTaskCount = (totalData.tasks || []).filter((task) => !isWaitingTask(task)).length;
     maxTaskCount = Number(data.max_task_count || totalData.max_task_count || 0);
-    waitingQueue = (waitingData.tasks || [])
-      .slice()
+    waitingQueue = (totalData.tasks || [])
+      .filter(isWaitingTask)
       .sort((a, b) => (a.queue_position || 0) - (b.queue_position || 0));
     renderTaskRows();
     refreshQueuePanel();
@@ -710,9 +710,8 @@ async function showTask(taskId) {
           <pre class="detail-command">${esc((task.resolved_command || []).join(' '))}</pre>
         </div>
       </div>`;
-    const logs = await api(`/api/task/${encodeURIComponent(taskId)}/logs`);
-    const stdout = logs.stdout || '';
-    const stderr = logs.stderr || '';
+    const stdout = task.stdout_tail || '';
+    const stderr = task.stderr_tail || '';
     setTaskLogs(
       stdout || stderr ? `[stdout]\n${stdout}\n\n[stderr]\n${stderr}` : '',
       !(stdout || stderr)

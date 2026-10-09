@@ -871,6 +871,7 @@ def test_process_task_cmd_proxy_can_use_agent_reported_tcp_url():
 
 
 def test_master_task_log_capture_drains_fast_failed_process():
+    """Task details include final process output without a separate logs request."""
     with tempfile.TemporaryDirectory() as master_ws, tempfile.TemporaryDirectory() as task_ws:
         server = PdbMasterApiServer(workspace=master_ws)
         task = server._create_task_record(
@@ -896,10 +897,17 @@ def test_master_task_log_capture_drains_fast_failed_process():
 
         proc = server._start_task_process(task, os.environ.copy())
         proc.wait(timeout=5)
-        server._drain_finished_task_runtime(task)
+        client = TestClient(server._app)
+        response = client.get(f"/api/task/{task['task_id']}")
+        assert response.status_code == 200
+        detail = response.json()["task"]
 
         assert task["process_status"] == "failed"
         assert task["exit_code"] == 7
+        assert detail["process_status"] == "failed"
+        assert detail["exit_code"] == 7
+        assert "stdout before" in detail["stdout_tail"]
+        assert "RuntimeError: master task boom" in detail["stderr_tail"]
         assert "stdout before" in _tail_file(task["stdout_log_path"])
         stderr = _tail_file(task["stderr_log_path"])
         assert "Traceback (most recent call last)" in stderr

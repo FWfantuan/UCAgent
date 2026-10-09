@@ -288,37 +288,103 @@ def _swarm_task_id_from_service_name(name: str) -> str:
 
 
 def _tail_file(path: str, max_lines: int = 200) -> str:
-    if not path or not os.path.isfile(path):
+    """Read the last lines backwards, preserving UTF-8 and universal newlines."""
+    if not path or not os.path.isfile(path) or max_lines <= 0:
         return ""
-    dq: Deque[str] = collections.deque(maxlen=max_lines)
-    with open(path, "r", encoding="utf-8", errors="replace") as fh:
-        for line in fh:
-            dq.append(line)
-    return "".join(dq)
+    blocks = []
+    separators = 0
+    next_byte = b""
+    with open(path, "rb") as fh:
+        position = fh.seek(0, os.SEEK_END)
+        while position > 0 and separators <= max_lines:
+            size = min(8192, position)
+            position -= size
+            fh.seek(position)
+            block = fh.read(size)
+            blocks.append(block)
+            separators += block.count(b"\n") + block.count(b"\r") - block.count(b"\r\n")
+            # A CRLF split across blocks is still a single newline.
+            if block.endswith(b"\r") and next_byte == b"\n":
+                separators -= 1
+            next_byte = block[:1]
+    text = b"".join(reversed(blocks)).decode("utf-8", errors="replace")
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    lines = text.split("\n")
+    trailing_newline = lines[-1] == ""
+    if trailing_newline:
+        lines.pop()
+    return "\n".join(lines[-max_lines:]) + ("\n" if trailing_newline and lines else "")
 
 
 def _tail_files(paths: List[str], max_lines: int = 200) -> str:
-    dq: Deque[str] = collections.deque(maxlen=max_lines)
-    for path in paths:
-        if not path or not os.path.isfile(path):
-            continue
-        with open(path, "r", encoding="utf-8", errors="replace") as fh:
-            for line in fh:
-                dq.append(line)
-    return "".join(dq)
+    """Tail files in their original order, skipping earlier files once full."""
+    parts = []
+    remaining = max_lines
+    for path in reversed(paths):
+        if remaining <= 0:
+            break
+        tail = _tail_file(path, remaining)
+        if tail:
+            parts.append(tail)
+            remaining -= tail.count("\n") + int(not tail.endswith("\n"))
+    return "".join(reversed(parts))
+
+
+_LOG_SCAN_CACHE = collections.OrderedDict()
+_LOG_SCAN_LOCK = threading.Lock()
 
 
 def _file_contains_any(path: str, markers: Tuple[str, ...]) -> bool:
-    if not path or not os.path.isfile(path):
+    """Scan append-only logs incrementally, resetting on replacement or truncation."""
+    if not path or not markers:
         return False
-    try:
-        with open(path, "r", encoding="utf-8", errors="replace") as fh:
-            for line in fh:
-                if any(marker in line for marker in markers):
-                    return True
-    except OSError:
-        return False
-    return False
+    key = (os.path.abspath(path), markers)
+    needles = tuple(marker.encode("utf-8") for marker in markers)
+    overlap_size = max(map(len, needles)) - 1
+    # Serialize readers so simultaneous polling cannot move a cached offset backwards.
+    with _LOG_SCAN_LOCK:
+        try:
+            with open(path, "rb") as fh:
+                stat = os.fstat(fh.fileno())
+                signature = (stat.st_dev, stat.st_ino, stat.st_size,
+                             stat.st_mtime_ns, stat.st_ctime_ns)
+                cached = _LOG_SCAN_CACHE.get(key)
+                found, overlap, position = False, b"", 0
+                if cached:
+                    previous, found, overlap = cached
+                    if signature == previous:
+                        _LOG_SCAN_CACHE.move_to_end(key)
+                        return found
+                    if signature[:2] == previous[:2] and stat.st_size > previous[2]:
+                        position = previous[2]
+                        # A rewritten file can grow too; verify the previous suffix.
+                        fh.seek(position - len(overlap))
+                        if fh.read(len(overlap)) != overlap:
+                            found, overlap, position = False, b"", 0
+                    else:
+                        found, overlap = False, b""
+                fh.seek(position)
+                while not found and position < stat.st_size:
+                    block = fh.read(min(8192, stat.st_size - position))
+                    if not block:
+                        break
+                    position += len(block)
+                    data = overlap + block
+                    found = any(needle in data for needle in needles)
+                    # Retain marker prefixes spanning a read or polling boundary.
+                    overlap = data[-overlap_size:] if overlap_size > 0 else b""
+                if found and position < stat.st_size:
+                    fh.seek(max(0, stat.st_size - overlap_size))
+                    overlap = fh.read(overlap_size)
+                _LOG_SCAN_CACHE[key] = (signature, found, overlap)
+                _LOG_SCAN_CACHE.move_to_end(key)
+                # Runtime-only bounded cache: never persist log state in task records.
+                if len(_LOG_SCAN_CACHE) > 256:
+                    _LOG_SCAN_CACHE.popitem(last=False)
+                return found
+        except OSError:
+            _LOG_SCAN_CACHE.pop(key, None)
+            return False
 
 
 def _task_stderr_tail(task: Dict[str, Any], max_lines: int = 200) -> str:
@@ -7790,6 +7856,7 @@ class PdbMasterApiServer:
                 task = self._get_task(task_id)
             except KeyError as exc:
                 raise HTTPException(status_code=404, detail=str(exc)) from exc
+            self._drain_finished_task_runtime(task)
             data = self._task_public(task, include_logs=True)
             if str(data.get("process_status") or "") == _WAITING_TASK_STATUS:
                 data["queue_position"] = self._waiting_queue_positions().get(task_id)
